@@ -6,7 +6,7 @@ import random
 import json
 import os
 
-TOKEN = "REDACTED"
+TOKEN = os.environ.get("BOT_TOKEN")
 
 VIP_USERS = ["c_naw"]
 
