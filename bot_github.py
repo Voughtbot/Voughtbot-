@@ -27,7 +27,7 @@ def persistent_file(filename):
         shutil.copy2(source, target)
     return target
 
-TOKEN = "REDACTED"
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 VIP_USERS = ["c_naw"]
 
