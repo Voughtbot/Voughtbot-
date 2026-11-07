@@ -1,10 +1,11 @@
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application,MessageHandler, ContextTypes, filters
 from telegram.error import BadRequest
 from telegram import Update, ReactionTypeEmoji
 import random
 import json
 import os
+import time
 
 TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -353,6 +354,43 @@ def save_two_hour_messages(messages):
 two_hour_messages = load_two_hour_messages()
 waiting_for_delete_reply = {}
 
+# Persistent settings for scheduled tag/message actions
+SCHEDULE_SETTINGS_FILE = "schedule_settings.json"
+DEFAULT_SCHEDULE_SETTINGS = {
+    "tag": {"mode": "time", "interval_minutes": 382, "message_threshold": 600},
+    "normal": {"mode": "time", "interval_minutes": 300, "message_threshold": 700},
+    "counters": {},
+    "last_runs": {}
+}
+
+
+def load_schedule_settings():
+    try:
+        with open(SCHEDULE_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, dict):
+            saved = {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        saved = {}
+
+    settings = json.loads(json.dumps(DEFAULT_SCHEDULE_SETTINGS))
+    for key in ("tag", "normal"):
+        if isinstance(saved.get(key), dict):
+            settings[key].update(saved[key])
+    for key in ("counters", "last_runs"):
+        if isinstance(saved.get(key), dict):
+            settings[key] = saved[key]
+    return settings
+
+
+def save_schedule_settings():
+    with open(SCHEDULE_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(schedule_settings, f, ensure_ascii=False, indent=2)
+
+
+schedule_settings = load_schedule_settings()
+waiting_for_schedule_action = {}
+
 VIP_DYNAMIC_REPLIES_FILE = "vip_dynamic_replies.json"
 
 
@@ -446,6 +484,40 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global subscribers, waiting_for_post
 
+    # Count all new human messages in each group, not messages from a single member.
+    # Bot messages and channel/sender-chat messages are excluded.
+    if (
+        update.effective_chat
+        and update.effective_chat.type in ("group", "supergroup")
+        and update.effective_user
+        and not update.effective_user.is_bot
+        and not update.message.sender_chat
+    ):
+        group_id = str(update.effective_chat.id)
+        counters = schedule_settings.setdefault("counters", {})
+        group_counts = counters.setdefault(group_id, {"tag": 0, "normal": 0})
+        group_counts.setdefault("tag", 0)
+        group_counts.setdefault("normal", 0)
+        counter_changed = False
+
+        for target in ("tag", "normal"):
+            target_settings = schedule_settings[target]
+            if target_settings.get("mode") == "messages":
+                group_counts[target] += 1
+                counter_changed = True
+                threshold = max(1, int(target_settings.get("message_threshold", 1)))
+                if group_counts[target] >= threshold:
+                    group_counts[target] = 0
+                    try:
+                        if target == "tag":
+                            await send_tag_to_group(context, update.effective_chat.id)
+                        else:
+                            await send_normal_to_group(context, update.effective_chat.id)
+                    except Exception as e:
+                        print(f"Message-count {target} action failed for {group_id}: {e}")
+        if counter_changed:
+            save_schedule_settings()
+
     # VIP DYNAMIC REPLY ADD SYSTEM
     if (
         update.effective_user
@@ -456,8 +528,285 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_id = update.effective_user.id
 
+        pending_media = waiting_for_schedule_action.get(user_id)
+        if (
+            pending_media
+            and pending_media.get("step") == "add_message"
+            and update.message.animation
+        ):
+            gif_item = {
+                "type": "animation",
+                "value": update.message.animation.file_id
+            }
+            if pending_media.get("target") == "tag":
+                two_hour_messages.append(gif_item)
+                save_two_hour_messages(two_hour_messages)
+            else:
+                scheduled_messages.append(gif_item)
+                save_scheduled_messages()
+            waiting_for_schedule_action.pop(user_id, None)
+            await update.message.reply_text("✅ GIF ذخیره شد.")
+            return
+
         if update.message.text:
             command_text = update.message.text.strip()
+
+            # Private-chat management for scheduled tag and normal messages.
+            pending = waiting_for_schedule_action.get(user_id)
+            if pending:
+                step = pending.get("step")
+                target = pending.get("target")
+                target_label = "تگ" if target == "tag" else "پیام معمولی"
+                text_value = command_text.strip()
+
+                if text_value in ("لغو", "cancel", "/cancel"):
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text("❌ عملیات لغو شد.")
+                    return
+
+                if step == "choose_mode":
+                    time_choices = ("زمان", "بر اساس زمان", "تگ بر اساس زمان", "پیام بر اساس زمان")
+                    message_choices = ("پیام", "بر اساس پیام", "تگ بر اساس پیام", "پیام بر اساس تعداد پیام")
+                    if text_value in time_choices:
+                        pending["step"] = "enter_time"
+                        await update.message.reply_text(
+                            "زمان مورد نظر را به شکل ساعت:دقیقه بنویسید. مثال: 6:22\nبرای لغو: لغو"
+                        )
+                        return
+                    if text_value in message_choices:
+                        pending["step"] = "enter_threshold"
+                        await update.message.reply_text(
+                            f"می‌خواهید بعد از چند پیام جدید گروه {target_label} انجام شود؟\n"
+                            "مجموع پیام‌های همه اعضا حساب می‌شود. فقط عدد بفرستید. مثال: 600"
+                        )
+                        return
+                    mode_keyboard = ReplyKeyboardMarkup(
+                        [["بر اساس زمان"], ["بر اساس پیام"], ["لغو"]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                    await update.message.reply_text(
+                        "یکی از این دو گزینه را انتخاب کنید:",
+                        reply_markup=mode_keyboard
+                    )
+                    return
+
+                if step == "enter_time":
+                    try:
+                        parts = text_value.split(":")
+                        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                            raise ValueError
+                        hours, minutes = map(int, parts)
+                        if hours < 0 or minutes < 0 or minutes > 59 or (hours == 0 and minutes == 0):
+                            raise ValueError
+                        total_minutes = hours * 60 + minutes
+                    except ValueError:
+                        await update.message.reply_text("فرمت زمان درست نیست. نمونه صحیح: 6:22")
+                        return
+
+                    schedule_settings[target]["mode"] = "time"
+                    schedule_settings[target]["interval_minutes"] = total_minutes
+                    for group_id in group_members:
+                        schedule_settings.setdefault("last_runs", {}).setdefault(group_id, {})[target] = time.time()
+                    save_schedule_settings()
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text(
+                        f"✅ زمان‌بندی {target_label} بر اساس زمان تنظیم شد: {hours}:{minutes:02d}"
+                    )
+                    return
+
+                if step == "enter_threshold":
+                    if not text_value.isdigit() or int(text_value) < 1:
+                        await update.message.reply_text("لطفاً یک عدد صحیح بزرگ‌تر از صفر بفرستید.")
+                        return
+                    threshold = int(text_value)
+                    schedule_settings[target]["mode"] = "messages"
+                    schedule_settings[target]["message_threshold"] = threshold
+                    for group_id in schedule_settings.setdefault("counters", {}):
+                        schedule_settings["counters"][group_id][target] = 0
+                    save_schedule_settings()
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text(
+                        f"✅ {target_label} بر اساس تعداد پیام تنظیم شد.\n"
+                        f"بعد از هر {threshold} پیام جدید در گروه، یک بار اجرا می‌شود."
+                    )
+                    return
+
+                if step == "choose_message_action":
+                    if text_value in ("افزودن", "اضافه", "افزودن پیام"):
+                        pending["step"] = "add_message"
+                        await update.message.reply_text("متن پیام جدید را بفرستید. برای لغو بنویسید «لغو».")
+                        return
+                    if text_value in ("فهرست", "لیست", "نمایش"):
+                        messages = two_hour_messages if target == "tag" else scheduled_messages
+                        if not messages:
+                            await update.message.reply_text("هنوز پیامی ذخیره نشده است.")
+                        else:
+                            listing = "\n".join(
+                                f"{i}. {'[GIF]' if isinstance(item, dict) and item.get('type') == 'animation' else item}"
+                                for i, item in enumerate(messages, 1)
+                            )
+                            await update.message.reply_text("فهرست پیام‌ها:\n" + listing)
+                        return
+                    if text_value in ("ویرایش", "ویرایش پیام"):
+                        messages = two_hour_messages if target == "tag" else scheduled_messages
+                        if not messages:
+                            await update.message.reply_text("پیامی برای ویرایش وجود ندارد.")
+                            return
+                        pending["step"] = "edit_index"
+                        listing = "\n".join(
+                                f"{i}. {'[GIF]' if isinstance(item, dict) and item.get('type') == 'animation' else item}"
+                                for i, item in enumerate(messages, 1)
+                            )
+                        await update.message.reply_text("شماره پیام موردنظر را بفرستید:\n" + listing)
+                        return
+                    if text_value in ("حذف", "حذف پیام"):
+                        messages = two_hour_messages if target == "tag" else scheduled_messages
+                        if not messages:
+                            await update.message.reply_text("پیامی برای حذف وجود ندارد.")
+                            return
+                        pending["step"] = "delete_index"
+                        listing = "\n".join(
+                                f"{i}. {'[GIF]' if isinstance(item, dict) and item.get('type') == 'animation' else item}"
+                                for i, item in enumerate(messages, 1)
+                            )
+                        await update.message.reply_text("شماره پیام موردنظر برای حذف را بفرستید:\n" + listing)
+                        return
+                    message_keyboard = ReplyKeyboardMarkup(
+                        [["افزودن", "فهرست"], ["ویرایش", "حذف"], ["لغو"]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                    await update.message.reply_text(
+                        "یکی از گزینه‌ها را انتخاب کنید:",
+                        reply_markup=message_keyboard
+                    )
+                    return
+
+                if step == "add_message":
+                    if not text_value:
+                        await update.message.reply_text("متن پیام خالی است؛ دوباره بفرستید.")
+                        return
+                    messages = two_hour_messages if target == "tag" else scheduled_messages
+                    messages.append(text_value)
+                    if target == "tag":
+                        save_two_hour_messages(two_hour_messages)
+                    else:
+                        save_scheduled_messages()
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text("✅ پیام جدید ذخیره شد.")
+                    return
+
+                if step in ("edit_index", "delete_index"):
+                    messages = two_hour_messages if target == "tag" else scheduled_messages
+                    if not text_value.isdigit() or not 1 <= int(text_value) <= len(messages):
+                        await update.message.reply_text("شماره معتبر نیست؛ یک شماره از فهرست بفرستید.")
+                        return
+                    index = int(text_value) - 1
+                    if step == "edit_index":
+                        pending["step"] = "edit_text"
+                        pending["index"] = index
+                        await update.message.reply_text("متن جدید این پیام را بفرستید.")
+                        return
+                    removed = messages.pop(index)
+                    if target == "tag":
+                        save_two_hour_messages(two_hour_messages)
+                    else:
+                        save_scheduled_messages()
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text(f"✅ پیام حذف شد: {removed}")
+                    return
+
+                if step == "edit_text":
+                    messages = two_hour_messages if target == "tag" else scheduled_messages
+                    index = pending.get("index", -1)
+                    if not text_value or not 0 <= index < len(messages):
+                        await update.message.reply_text("متن یا شماره پیام معتبر نیست.")
+                        return
+                    messages[index] = text_value
+                    if target == "tag":
+                        save_two_hour_messages(two_hour_messages)
+                    else:
+                        save_scheduled_messages()
+                    waiting_for_schedule_action.pop(user_id, None)
+                    await update.message.reply_text("✅ پیام ویرایش و ذخیره شد.")
+                    return
+
+            if command_text == "مدیریت تگ":
+                tag_keyboard = ReplyKeyboardMarkup(
+                    [["مدیریت تگ کردن"], ["مدیریت پیام‌های تگ"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "مدیریت تگ؛ یکی از دو بخش را انتخاب کنید:",
+                    reply_markup=tag_keyboard
+                )
+                return
+
+            if command_text in ("مدیریت تگ کردن", "تنظیم تگ"):
+                waiting_for_schedule_action[user_id] = {"step": "choose_mode", "target": "tag"}
+                mode_keyboard = ReplyKeyboardMarkup(
+                    [["بر اساس زمان"], ["بر اساس پیام"], ["لغو"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "روش اجرای تگ را انتخاب کنید:",
+                    reply_markup=mode_keyboard
+                )
+                return
+
+            if command_text in ("مدیریت پیام‌های تگ", "مدیریت پیام هاي تگ"):
+                waiting_for_schedule_action[user_id] = {"step": "choose_message_action", "target": "tag"}
+                message_keyboard = ReplyKeyboardMarkup(
+                    [["افزودن", "فهرست"], ["ویرایش", "حذف"], ["لغو"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "مدیریت متن‌های همراه تگ:",
+                    reply_markup=message_keyboard
+                )
+                return
+
+            if command_text in ("مدیریت پیام معمولی", "مدیریت پیام دادن"):
+                normal_keyboard = ReplyKeyboardMarkup(
+                    [["تنظیم زمان پیام"], ["مدیریت متن پیام معمولی"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "مدیریت پیام معمولی؛ یکی از دو بخش را انتخاب کنید:",
+                    reply_markup=normal_keyboard
+                )
+                return
+
+            if command_text == "تنظیم زمان پیام":
+                waiting_for_schedule_action[user_id] = {"step": "choose_mode", "target": "normal"}
+                mode_keyboard = ReplyKeyboardMarkup(
+                    [["بر اساس زمان"], ["بر اساس پیام"], ["لغو"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "روش ارسال پیام معمولی را انتخاب کنید:",
+                    reply_markup=mode_keyboard
+                )
+                return
+
+            if command_text == "مدیریت متن پیام معمولی":
+                waiting_for_schedule_action[user_id] = {"step": "choose_message_action", "target": "normal"}
+                message_keyboard = ReplyKeyboardMarkup(
+                    [["افزودن", "فهرست"], ["ویرایش", "حذف"], ["لغو"]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
+                await update.message.reply_text(
+                    "مدیریت پیام‌های معمولی:",
+                    reply_markup=message_keyboard
+                )
+                return
 
             # DELETE VIP REPLY - START
             if command_text.lower() == "delete vip reply":
@@ -1679,6 +2028,117 @@ HOURLY_MESSAGES = [
 ]
 
 
+SCHEDULED_MESSAGES_FILE = "scheduled_messages.json"
+
+
+def load_scheduled_messages():
+    try:
+        with open(SCHEDULED_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return list(HOURLY_MESSAGES) + [{"type": "animation", "value": SOBBING_GIF}]
+
+
+def save_scheduled_messages():
+    with open(SCHEDULED_MESSAGES_FILE, "w", encoding="utf-8") as f:
+        json.dump(scheduled_messages, f, ensure_ascii=False, indent=2)
+
+
+scheduled_messages = load_scheduled_messages()
+
+
+async def send_tag_to_group(context: ContextTypes.DEFAULT_TYPE, chat_id):
+    members = group_members.get(str(chat_id), {})
+    if not members:
+        return
+
+    eligible_members = []
+    for user_id, user in members.items():
+        try:
+            member = await context.bot.get_chat_member(int(chat_id), int(user_id))
+            if member.status in ("left", "kicked"):
+                continue
+            if member.user.id in (8862254257, 777000) or member.user.is_bot:
+                continue
+            if member.user.username in VIP_USERS or is_exempt(str(chat_id), member.user.id):
+                continue
+            eligible_members.append(member.user)
+        except Exception as e:
+            print(f"Could not check member {user_id} in {chat_id}: {e}")
+
+    if not eligible_members:
+        return
+
+    selected_user = random.choice(eligible_members)
+    tag_messages = two_hour_messages
+    selected_text = random.choice(tag_messages) if tag_messages else ""
+    mention = (
+        f'<a href="tg://user?id={selected_user.id}">'
+        f'{selected_user.first_name or "User"}</a>'
+    )
+    if isinstance(selected_text, dict) and selected_text.get("type") == "animation":
+        await context.bot.send_animation(
+            chat_id=int(chat_id),
+            animation=selected_text["value"],
+            caption=mention,
+            parse_mode="HTML"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text=f"{mention} {selected_text}",
+            parse_mode="HTML"
+        )
+
+
+async def send_normal_to_group(context: ContextTypes.DEFAULT_TYPE, chat_id):
+    choices = scheduled_messages
+    if not choices:
+        return
+    selected = random.choice(choices)
+    if isinstance(selected, dict) and selected.get("type") == "animation":
+        await context.bot.send_animation(chat_id=int(chat_id), animation=selected["value"])
+    elif isinstance(selected, str) and selected.startswith("CgAC"):
+        await context.bot.send_animation(chat_id=int(chat_id), animation=selected)
+    else:
+        await context.bot.send_message(chat_id=int(chat_id), text=str(selected))
+
+
+async def scheduled_actions_tick(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    last_runs = schedule_settings.setdefault("last_runs", {})
+    changed = False
+
+    for group_id in list(group_members.keys()):
+        for target in ("tag", "normal"):
+            target_settings = schedule_settings[target]
+            if target_settings.get("mode") != "time":
+                continue
+            group_last = last_runs.setdefault(str(group_id), {})
+            previous = group_last.get(target)
+            if previous is None:
+                group_last[target] = now
+                changed = True
+                continue
+            interval = max(1, int(target_settings.get("interval_minutes", 1))) * 60
+            if now - float(previous) >= interval:
+                try:
+                    if target == "tag":
+                        await send_tag_to_group(context, int(group_id))
+                    else:
+                        await send_normal_to_group(context, int(group_id))
+                    group_last[target] = now
+                    changed = True
+                except Exception as e:
+                    print(f"Scheduled {target} action failed for {group_id}: {e}")
+
+    if changed:
+        save_schedule_settings()
+
+
 async def hourly_message(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in subscribers:
         try:
@@ -1717,68 +2177,12 @@ async def bot_started(app):
             print(f"Startup message failed for {chat_id}: {e}")
 
 async def two_hour_random_mention(context: ContextTypes.DEFAULT_TYPE):
-    for chat_id, members in list(group_members.items()):
+    # Kept as a compatibility wrapper; the new scheduler uses scheduled_actions_tick.
+    for chat_id in list(group_members.keys()):
         try:
-            if not members:
-                continue
-
-            eligible_members = []
-
-            for user_id, user in members.items():
-                try:
-                    member = await context.bot.get_chat_member(
-                        int(chat_id),
-                        int(user_id)
-                    )
-
-                    if member.status in ("left", "kicked"):
-                        continue
-
-                    # Never select Telegram service accounts or bots
-                    if member.user.id in (8862254257, 777000):
-                        continue
-
-
-                    # Never select any bot account
-                    if member.user.is_bot:
-                        continue
-
-                    # Never select VIP accounts
-                    if member.user.username in VIP_USERS:
-                        continue
-
-                    # Never select exempt users in this group
-                    if is_exempt(chat_id, member.user.id):
-                        continue
-
-                    eligible_members.append(member.user)
-
-                except Exception as e:
-                    print(
-                        f"Could not check member {user_id} "
-                        f"in {chat_id}: {e}"
-                    )
-
-            if not eligible_members:
-                continue
-
-            selected_user = random.choice(eligible_members)
-            selected_text = random.choice(two_hour_messages)
-
-            mention = (
-                f'<a href="tg://user?id={selected_user.id}">'
-                f'{selected_user.first_name or "User"}'
-                f'</a>'
-            )
-
-            await context.bot.send_message(
-                chat_id=int(chat_id),
-                text=f"{mention} {selected_text}",
-                parse_mode="HTML"
-            )
-
+            await send_tag_to_group(context, int(chat_id))
         except Exception as e:
-            print(f"2-hour mention failed for {chat_id}: {e}")
+            print(f"Tag message failed for {chat_id}: {e}")
 
 
 def main():
@@ -1808,16 +2212,9 @@ def main():
         )
     )
     app.job_queue.run_repeating(
-        two_hour_random_mention,
-        interval=1320,
-        first=1320,
-        job_kwargs={"misfire_grace_time": None}
-    )
-
-    app.job_queue.run_repeating(
-        hourly_message,
-        interval=1800,
-        first=1800,
+        scheduled_actions_tick,
+        interval=30,
+        first=30,
         job_kwargs={"misfire_grace_time": None}
     )
     print("Bot started...")
