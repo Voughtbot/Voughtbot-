@@ -6,22 +6,42 @@ import random
 import json
 import os
 import time
+import shutil
 
-TOKEN = os.environ.get("BOT_TOKEN")
+
+# Persistent storage:
+# FadeHost keeps /data across deploys. On environments where /data is not
+# writable (for example, a local Android Termux session), use a local data
+# folder instead. Existing JSON files are copied once, never overwritten.
+if os.path.isdir("/data") and os.access("/data", os.W_OK):
+    DATA_DIR = "/data"
+else:
+    DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def persistent_file(filename):
+    target = os.path.join(DATA_DIR, filename)
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if not os.path.exists(target) and os.path.isfile(source):
+        shutil.copy2(source, target)
+    return target
+
+TOKEN = "REDACTED"
 
 VIP_USERS = ["c_naw"]
 
-SUBSCRIBERS_FILE = "subscribers.json"
+SUBSCRIBERS_FILE = persistent_file("subscribers.json")
 waiting_for_post = set()
 waiting_for_private_group = set()
 private_group_targets = {}
 
 pending_albums = {}
-MEMBERS_FILE = "members.json"
-GROUP_MEMBERS_FILE = "group_members.json"
+MEMBERS_FILE = persistent_file("members.json")
+GROUP_MEMBERS_FILE = persistent_file("group_members.json")
 group_members = {}
 
-EXEMPT_USERS_FILE = "exempt_users.json"
+EXEMPT_USERS_FILE = persistent_file("exempt_users.json")
 
 def load_exempt_users():
     try:
@@ -40,7 +60,7 @@ def is_exempt(chat_id, user_id):
 
 exempt_users = load_exempt_users()
 
-NICKNAMES_FILE = "nicknames.json"
+NICKNAMES_FILE = persistent_file("nicknames.json")
 
 replies = {
     "hi im mona": "Mona?Homelander's servant. Low IQ but good heart. Vought fan. Welcome, little one. Don't embarrass yourself too much.",
@@ -289,7 +309,7 @@ def save_nicknames(nicknames):
 
 nicknames = load_nicknames()
 
-DYNAMIC_REPLIES_FILE = "dynamic_replies.json"
+DYNAMIC_REPLIES_FILE = persistent_file("dynamic_replies.json")
 
 
 def load_dynamic_replies():
@@ -310,7 +330,7 @@ def save_dynamic_replies(dynamic_replies):
 dynamic_replies = load_dynamic_replies()
 waiting_for_dynamic_reply = {}
 
-PUNISHMENT_FILE = "punishment_replies.json"
+PUNISHMENT_FILE = persistent_file("punishment_replies.json")
 
 
 def load_punishment_replies():
@@ -333,7 +353,7 @@ waiting_for_punishment_reply = {}
 
 waiting_for_two_hour_message = {}
 
-TWO_HOUR_MESSAGES_FILE = "two_hour_messages.json"
+TWO_HOUR_MESSAGES_FILE = persistent_file("two_hour_messages.json")
 
 
 def load_two_hour_messages():
@@ -355,7 +375,7 @@ two_hour_messages = load_two_hour_messages()
 waiting_for_delete_reply = {}
 
 # Persistent settings for scheduled tag/message actions
-SCHEDULE_SETTINGS_FILE = "schedule_settings.json"
+SCHEDULE_SETTINGS_FILE = persistent_file("schedule_settings.json")
 DEFAULT_SCHEDULE_SETTINGS = {
     "tag": {"mode": "time", "interval_minutes": 382, "message_threshold": 600},
     "normal": {"mode": "time", "interval_minutes": 300, "message_threshold": 700},
@@ -391,7 +411,7 @@ def save_schedule_settings():
 schedule_settings = load_schedule_settings()
 waiting_for_schedule_action = {}
 
-VIP_DYNAMIC_REPLIES_FILE = "vip_dynamic_replies.json"
+VIP_DYNAMIC_REPLIES_FILE = persistent_file("vip_dynamic_replies.json")
 
 
 def load_vip_dynamic_replies():
@@ -2028,7 +2048,7 @@ HOURLY_MESSAGES = [
 ]
 
 
-SCHEDULED_MESSAGES_FILE = "scheduled_messages.json"
+SCHEDULED_MESSAGES_FILE = persistent_file("scheduled_messages.json")
 
 
 def load_scheduled_messages():
